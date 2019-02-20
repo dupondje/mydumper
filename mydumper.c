@@ -94,6 +94,8 @@ gchar *tables_skiplist_file= NULL;
 char **tables= NULL;
 GList *no_updated_tables=NULL;
 
+guint have_binlog_snapshots = 0;
+
 #ifdef WITH_BINLOG
 gboolean need_binlogs= FALSE;
 gchar *binlog_directory= NULL;
@@ -419,21 +421,34 @@ void write_snapshot_info(MYSQL *conn, FILE *file) {
 	guint isms;
 	guint i;
 
-	mysql_query(conn,"SHOW MASTER STATUS");
-	master=mysql_store_result(conn);
-	if (master && (row=mysql_fetch_row(master))) {
-		masterlog=row[0];
-		masterpos=row[1];
-		/* Oracle/Percona GTID */
-		if(mysql_num_fields(master) == 5) {
-			mastergtid=row[4];
-		} else {
-			/* Let's try with MariaDB 10.x */
-			/* Use gtid_binlog_pos due to issue with gtid_current_pos with galera cluster, gtid_binlog_pos works as well with normal mariadb server https://jira.mariadb.org/browse/MDEV-10279 */
-			mysql_query(conn, "SELECT @@gtid_binlog_pos");
-			mdb=mysql_store_result(conn);
-			if (mdb && (row=mysql_fetch_row(mdb))) {
-				mastergtid=row[0];
+	if (have_binlog_snapshots) {
+		mysql_query(conn, "SHOW STATUS LIKE 'binlog_snapshot_%'");
+		master=mysql_store_result(conn);
+		while ((row=mysql_fetch_row(master))) {
+			if (row[0] && strcmp(row[0],"Binlog_snapshot_file")) {
+				masterlog = row[1];
+			}
+			if (row[0] && strcmp(row[0],"Binlog_snapshot_position")) {
+				masterpos = row[1];
+			}
+		}
+	} else {
+		mysql_query(conn,"SHOW MASTER STATUS");
+		master=mysql_store_result(conn);
+		if (master && (row=mysql_fetch_row(master))) {
+			masterlog=row[0];
+			masterpos=row[1];
+			/* Oracle/Percona GTID */
+			if(mysql_num_fields(master) == 5) {
+				mastergtid=row[4];
+			} else {
+				/* Let's try with MariaDB 10.x */
+				/* Use gtid_binlog_pos due to issue with gtid_current_pos with galera cluster, gtid_binlog_pos works as well with normal mariadb server https://jira.mariadb.org/browse/MDEV-10279 */
+				mysql_query(conn, "SELECT @@gtid_binlog_pos");
+				mdb=mysql_store_result(conn);
+				if (mdb && (row=mysql_fetch_row(mdb))) {
+					mastergtid=row[0];
+				}
 			}
 		}
 	}
@@ -1310,10 +1325,24 @@ void start_dump(MYSQL *conn)
 				errors++;
 			}
 
-			if(mysql_query(conn, "LOCK BINLOG FOR BACKUP")) {
-				g_critical("Couldn't acquire LOCK BINLOG FOR BACKUP, snapshots will not be consistent: %s",mysql_error(conn));
+			MYSQL_RES *res = NULL;
+			if(mysql_query(conn, "SHOW STATUS LIKE 'binlog_snapshot_%'") || !(res = mysql_store_result(conn))) {
+				g_critical("Couldn't list binlog snapshots: %s",mysql_error(conn));
 				errors++;
+			} else {
+				if (!mysql_num_rows(res)) {
+					if(mysql_query(conn, "LOCK BINLOG FOR BACKUP")) {
+						g_critical("Couldn't acquire LOCK BINLOG FOR BACKUP, snapshots will not be consistent: %s",mysql_error(conn));
+						errors++;
+					}
+				} else {
+					have_binlog_snapshots=1;
+				}
 			}
+
+			if (res)
+				mysql_free_result(res);
+
 		}else if(lock_all_tables){
 			// LOCK ALL TABLES
 			GString *query= g_string_sized_new(16777216);
@@ -1492,7 +1521,7 @@ void start_dump(MYSQL *conn)
 	if (trx_consistency_only){
 		g_message("Transactions started, unlocking tables");
 		mysql_query(conn, "UNLOCK TABLES /* trx-only */");
-		if(have_backup_locks)
+		if(have_backup_locks && !have_binlog_snapshots)
 			mysql_query(conn, "UNLOCK BINLOG");
 	}
 
